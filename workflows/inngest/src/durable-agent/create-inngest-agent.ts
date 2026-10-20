@@ -718,7 +718,12 @@ export interface InngestAgent<TOutput = undefined> {
    * Returns `false` when there is no matching active run.
    */
   abortThreadStream: Agent<any, any, TOutput>['abortThreadStream'];
-  abortThreadStreamAsync(target: { resourceId: string; threadId: string }): Promise<boolean>;
+  abortThreadStreamAsync(target: {
+    resourceId: string;
+    threadId: string;
+    clearPendingSignals?: boolean;
+    expectedRunId?: string;
+  }): Promise<boolean>;
   /** Abort a run by id, including on the Inngest worker executing it. */
   abortRunStream: Agent<any, any, TOutput>['abortRunStream'];
   /**
@@ -2198,10 +2203,17 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     },
 
     async abortThreadStreamAsync(target) {
-      const runId = await proxyRef!.getActiveThreadRunIdAsync(target);
-      if (!runId) return false;
-      await publishAbortRequest(getPubsub(), runId);
-      return true;
+      const reply = await requestThreadCommand(inngest, {
+        id: crypto.randomUUID(),
+        operation: 'abort',
+        agentId,
+        resourceId: target.resourceId,
+        threadId: target.threadId,
+        ...(target.expectedRunId === undefined ? {} : { expectedRunId: target.expectedRunId }),
+        ...(target.clearPendingSignals === undefined ? {} : { clearPendingSignals: target.clearPendingSignals }),
+      });
+      if (reply.error) throw new Error(reply.error);
+      return reply.aborted === true;
     },
 
     abortRunStream(runId) {

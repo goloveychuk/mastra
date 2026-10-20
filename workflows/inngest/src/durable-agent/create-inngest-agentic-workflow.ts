@@ -397,7 +397,14 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
               closing: !shouldContinue,
             },
           })) as ThreadReply;
-          if (reply?.signals?.length) {
+          if (reply?.aborted) {
+            state.lastStepResult = {
+              ...(state.lastStepResult ?? { warnings: [] }),
+              reason: 'abort',
+              isContinued: false,
+            };
+            shouldContinue = false;
+          } else if (reply?.signals?.length) {
             const messageList = new MessageList().deserialize(state.messageListState);
             state.messageId = messageList.rotateResponseMessageId(state.messageId);
             for (const input of reply.signals) messageList.addSignal(createSignal(input));

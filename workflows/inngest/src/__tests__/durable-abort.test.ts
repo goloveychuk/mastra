@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { InngestPubSub } from '../pubsub';
 import { INNGEST_PORT, startConnectInngestDevServer, stopInngestDevServer } from './durable-agent.test.utils';
 
 vi.setConfig({ testTimeout: 180_000, hookTimeout: 120_000 });
@@ -226,6 +227,37 @@ describe('durable agent abort on a connect worker', () => {
 
   it('abortThreadStream stops the run on the worker', async () => {
     await streamAndAbortThroughAgent((durableAgent, _runId, scope) => durableAgent.abortThreadStream(scope));
+  });
+
+  it('abortThreadStreamAsync persists the abort in Inngest instead of publishing a run control event', async () => {
+    const { buildAbortAgent } = await import('./fixtures/abort-agent');
+    const { durableAgent } = buildAbortAgent({ dbUrl, agentId, inngestPort: INNGEST_PORT });
+    const scope = { threadId: `abort-command-thread-${Date.now()}`, resourceId: 'abort-resource' };
+    const publish = vi.spyOn(InngestPubSub.prototype, 'publish');
+    const result = await durableAgent.stream('Count slowly.', {
+      memory: { thread: scope.threadId, resource: scope.resourceId },
+    });
+
+    let acknowledged = false;
+    const consume = async () => {
+      try {
+        for await (const chunk of result.output.fullStream as AsyncIterable<{ type: string }>) {
+          if (!acknowledged && chunk.type === 'text-delta') {
+            acknowledged = await durableAgent.abortThreadStreamAsync(scope);
+          }
+        }
+      } catch {
+        // An aborted stream may close through its error path after the command is applied.
+      } finally {
+        result.cleanup();
+      }
+    };
+
+    await Promise.race([consume(), workerHandle!.exited]);
+
+    expect(acknowledged).toBe(true);
+    expect(publish.mock.calls.some(([topic]) => topic === `agent.control.${result.runId}`)).toBe(false);
+    await expect(result.output.finishReason).resolves.toBe('aborted');
   });
 
   it('abortRunStream stops the run on the worker', async () => {

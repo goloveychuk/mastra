@@ -2342,12 +2342,22 @@ export const ABORT_AGENT_THREAD_ROUTE = createRoute({
         permission: MastraFGAPermissions.MEMORY_WRITE,
       });
 
-      const aborted = await agent.abortThreadStream({
-        resourceId: effectiveResourceId,
-        threadId: effectiveThreadId,
-        ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
-        expectedRunId,
-      });
+      const asyncAbort = (agent as { abortThreadStreamAsync?: (target: Record<string, unknown>) => Promise<boolean> })
+        .abortThreadStreamAsync;
+      const aborted =
+        asyncAbort && effectiveResourceId
+          ? await asyncAbort({
+              resourceId: effectiveResourceId,
+              threadId: effectiveThreadId,
+              ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
+              ...(expectedRunId === undefined ? {} : { expectedRunId }),
+            })
+          : await agent.abortThreadStream({
+              resourceId: effectiveResourceId,
+              threadId: effectiveThreadId,
+              ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
+              expectedRunId,
+            });
       return { aborted };
     } catch (error) {
       return handleError(error, 'error aborting agent thread');
@@ -2392,7 +2402,18 @@ export const CANCEL_AGENT_PENDING_SIGNALS_ROUTE = createRoute({
         effectiveResourceId,
         permission: MastraFGAPermissions.MEMORY_WRITE,
       });
-      return agent.cancelQueuedMessages({ resourceId: effectiveResourceId, threadId: effectiveThreadId, signalIds });
+      const asyncCancel = (
+        agent as {
+          cancelQueuedMessagesAsync?: (target: {
+            resourceId?: string;
+            threadId: string;
+            signalIds?: string[];
+          }) => Promise<{ cancelledSignalIds: string[] }>;
+        }
+      ).cancelQueuedMessagesAsync;
+      return asyncCancel && effectiveResourceId
+        ? asyncCancel({ resourceId: effectiveResourceId, threadId: effectiveThreadId, signalIds })
+        : agent.cancelQueuedMessages({ resourceId: effectiveResourceId, threadId: effectiveThreadId, signalIds });
     } catch (error) {
       return handleError(error, 'error cancelling pending thread signals');
     }

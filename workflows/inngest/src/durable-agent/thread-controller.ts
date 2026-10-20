@@ -25,11 +25,13 @@ type QueuedTurn = {
 };
 export type ThreadCommand = ThreadScope & {
   id: string;
-  operation: 'register' | 'send' | 'queue' | 'drain' | 'complete' | 'lookup' | 'cancel';
+  operation: 'register' | 'send' | 'queue' | 'drain' | 'complete' | 'lookup' | 'cancel' | 'abort';
   runId?: string;
   nextRunId?: string;
   signal?: SignalInput;
   closing?: boolean;
+  clearPendingSignals?: boolean;
+  expectedRunId?: string;
   ifActive?: { behavior?: 'deliver' | 'persist' | 'discard'; attributes?: AgentSignalAttributes };
   ifIdle?: { behavior?: 'wake' | 'persist' | 'discard'; attributes?: AgentSignalAttributes };
   streamOptions?: Record<string, unknown>;
@@ -41,15 +43,17 @@ export type ThreadReply = {
   accepted?: Exclude<SendAgentSignalAccepted, { action: 'wake' }>;
   signals?: SignalInput[];
   busy?: boolean;
+  aborted?: boolean;
   wake?: QueuedTurn;
   signal?: SignalInput;
   error?: string;
   cancelledSignalIds?: string[];
 };
-type ControllerState = {
+export type ControllerState = {
   runId?: string;
   agentId?: string;
   closing?: boolean;
+  abortedRunId?: string;
   signals: SignalInput[];
   queued: QueuedTurn[];
   replies: Record<string, ThreadReply>;
@@ -65,6 +69,126 @@ type ThreadFunctions = {
 };
 const clients = new WeakMap<Inngest, ThreadFunctions>();
 const hosts = new WeakMap<Inngest, Mastra>();
+
+export function applyThreadCommand(state: ControllerState, command: ThreadCommand): ThreadReply {
+  switch (command.operation) {
+    case 'register': {
+      const reply = { runId: state.runId ?? command.runId, busy: !!state.runId && state.runId !== command.runId };
+      if (!reply.busy) {
+        state.runId = command.runId;
+        state.agentId = command.agentId;
+        state.abortedRunId = undefined;
+      }
+      return reply;
+    }
+    case 'send':
+    case 'queue': {
+      if (command.runId && command.runId !== state.runId) {
+        return { error: 'No active Inngest run found for signal target' };
+      }
+      if (state.runId && state.agentId !== command.agentId) {
+        return { accepted: { action: 'blocked', reason: 'thread-blocked', runId: state.runId } };
+      }
+      const active = !!state.runId && !state.closing;
+      const behavior = active ? (command.ifActive?.behavior ?? 'deliver') : (command.ifIdle?.behavior ?? 'wake');
+      const signal = serializeThreadSignal(
+        resolveDeliveryAttributes(
+          createSignal(command.signal!),
+          active ? command.ifActive?.attributes : command.ifIdle?.attributes,
+        ),
+      );
+      if (behavior === 'discard' || behavior === 'persist') {
+        return {
+          accepted: { action: signal.transient ? 'discard' : behavior },
+          signal,
+        };
+      }
+      if (active && state.runId && command.operation === 'send') {
+        state.signals.push(signal);
+        return { accepted: { action: 'deliver', runId: state.runId } };
+      }
+      const turn: QueuedTurn = {
+        runId: command.nextRunId!,
+        agentId: command.agentId,
+        signal,
+        streamOptions: command.streamOptions,
+        queueOwnerId: command.queueOwnerId,
+      };
+      const reply: ThreadReply = { accepted: { action: 'deliver', runId: turn.runId } };
+      if (state.runId) {
+        state.queued.push(turn);
+      } else {
+        state.runId = turn.runId;
+        state.agentId = turn.agentId;
+        state.closing = false;
+        reply.wake = turn;
+      }
+      return reply;
+    }
+    case 'drain': {
+      const ownsRun = command.runId === state.runId;
+      const reply: ThreadReply = {
+        signals: ownsRun && !state.abortedRunId ? state.signals.splice(0) : [],
+        ...(ownsRun && state.abortedRunId === command.runId ? { aborted: true } : {}),
+      };
+      if (command.closing && ownsRun && !reply.signals?.length && !reply.aborted) state.closing = true;
+      return reply;
+    }
+    case 'complete': {
+      if (state.runId === command.runId) {
+        state.queued.unshift(
+          ...state.signals.splice(0).map(signal => ({
+            runId: `${command.runId}:${signal.id}`,
+            agentId: state.agentId!,
+            signal,
+          })),
+        );
+        state.abortedRunId = undefined;
+        const next = state.queued.shift();
+        state.runId = next?.runId;
+        state.agentId = next?.agentId;
+        state.closing = false;
+        return next ? { wake: next } : {};
+      }
+      return {};
+    }
+    case 'lookup':
+      return { runId: state.runId };
+    case 'abort': {
+      const ownsRun =
+        !!state.runId &&
+        (!command.runId || command.runId === state.runId) &&
+        (!command.expectedRunId || command.expectedRunId === state.runId);
+      if (!ownsRun) return { aborted: false };
+      if (command.clearPendingSignals) {
+        const ids = command.signalIds ? new Set(command.signalIds) : undefined;
+        state.queued = state.queued.filter(turn => (ids ? !ids.has(turn.signal.id) : false));
+        state.signals = state.signals.filter(signal => (ids ? !ids.has(signal.id) : false));
+      }
+      state.abortedRunId = state.runId;
+      return { aborted: true, runId: state.runId };
+    }
+    case 'cancel': {
+      const ids = new Set(command.signalIds);
+      const cancelledSignalIds: string[] = [];
+      state.queued = state.queued.filter(turn => {
+        const matches = command.signalIds
+          ? ids.has(turn.signal.id)
+          : turn.agentId === command.agentId && turn.queueOwnerId === command.queueOwnerId;
+        if (matches) cancelledSignalIds.push(turn.signal.id);
+        return !matches;
+      });
+      if (command.signalIds) {
+        state.signals = state.signals.filter(signal => {
+          if (!ids.has(signal.id)) return true;
+          cancelledSignalIds.push(signal.id);
+          return false;
+        });
+      }
+      return { cancelledSignalIds };
+    }
+  }
+}
 
 function threadKey(scope: ThreadScope): string {
   return `mastra.thread.${JSON.stringify([scope.resourceId, scope.threadId])}`;
@@ -87,106 +211,7 @@ function createThreadFunctions(inngest: Inngest) {
       const { command, replySignal } = received.data as { command: ThreadCommand; replySignal: string };
       let reply = state.replies[command.id];
       if (!reply) {
-        switch (command.operation) {
-          case 'register':
-            reply = { runId: state.runId ?? command.runId, busy: !!state.runId && state.runId !== command.runId };
-            if (!reply.busy) {
-              state.runId = command.runId;
-              state.agentId = command.agentId;
-            }
-            break;
-          case 'send':
-          case 'queue': {
-            if (command.runId && command.runId !== state.runId) {
-              reply = { error: 'No active Inngest run found for signal target' };
-              break;
-            }
-            if (state.runId && state.agentId !== command.agentId) {
-              reply = { accepted: { action: 'blocked', reason: 'thread-blocked', runId: state.runId } };
-              break;
-            }
-            const active = !!state.runId && !state.closing;
-            const behavior = active ? (command.ifActive?.behavior ?? 'deliver') : (command.ifIdle?.behavior ?? 'wake');
-            const signal = serializeThreadSignal(
-              resolveDeliveryAttributes(
-                createSignal(command.signal!),
-                active ? command.ifActive?.attributes : command.ifIdle?.attributes,
-              ),
-            );
-            if (behavior === 'discard' || behavior === 'persist') {
-              reply = {
-                accepted: { action: signal.transient ? 'discard' : behavior },
-                signal,
-              };
-            } else if (active && state.runId && command.operation === 'send') {
-              state.signals.push(signal);
-              reply = { accepted: { action: 'deliver', runId: state.runId } };
-            } else {
-              const turn: QueuedTurn = {
-                runId: command.nextRunId!,
-                agentId: command.agentId,
-                signal,
-                streamOptions: command.streamOptions,
-                queueOwnerId: command.queueOwnerId,
-              };
-              reply = { accepted: { action: 'deliver', runId: turn.runId } };
-              if (state.runId) {
-                state.queued.push(turn);
-              } else {
-                state.runId = turn.runId;
-                state.agentId = turn.agentId;
-                state.closing = false;
-                reply.wake = turn;
-              }
-            }
-            break;
-          }
-          case 'drain':
-            reply = { signals: command.runId === state.runId ? state.signals.splice(0) : [] };
-            if (command.closing && command.runId === state.runId && !reply.signals?.length) state.closing = true;
-            break;
-          case 'complete':
-            if (state.runId === command.runId) {
-              state.queued.unshift(
-                ...state.signals.splice(0).map(signal => ({
-                  runId: `${command.runId}:${signal.id}`,
-                  agentId: state.agentId!,
-                  signal,
-                })),
-              );
-              const next = state.queued.shift();
-              state.runId = next?.runId;
-              state.agentId = next?.agentId;
-              state.closing = false;
-              reply = next ? { wake: next } : {};
-            }
-            reply ??= {};
-            break;
-          case 'lookup':
-            reply = { runId: state.runId };
-            break;
-          case 'cancel': {
-            const ids = new Set(command.signalIds);
-            const cancelledSignalIds: string[] = [];
-            state.queued = state.queued.filter(turn => {
-              const matches = command.signalIds
-                ? ids.has(turn.signal.id)
-                : turn.agentId === command.agentId && turn.queueOwnerId === command.queueOwnerId;
-              if (matches) cancelledSignalIds.push(turn.signal.id);
-              return !matches;
-            });
-            if (command.signalIds) {
-              state.signals = state.signals.filter(signal => {
-                if (!ids.has(signal.id)) return true;
-                cancelledSignalIds.push(signal.id);
-                return false;
-              });
-            }
-            reply = { cancelledSignalIds };
-            break;
-          }
-        }
-        reply ??= { error: 'Unsupported Inngest thread command' };
+        reply = applyThreadCommand(state, command);
         state.replies[command.id] = reply;
       }
       for (let attempt = 0; attempt < 30; attempt++) {

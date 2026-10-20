@@ -30,6 +30,7 @@ import { createTool } from '../../../../tools';
 import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines, createSharedAgent } from '../aimock-scenario';
 
 const QUEUED = 'Queued follow-up';
+const QUEUED_AFTER_FAILURE = 'Queued after failed run';
 const CANCELLED = 'Cancelled follow-up';
 
 function requestText(request: any): string {
@@ -103,6 +104,70 @@ describeForAllEngines('AIMock scenario: queueMessage waits for the active run', 
       );
     },
   );
+
+  it.runIf(engine === 'inngest')('starts a queued turn after the active turn fails', async () => {
+    const threadId = 'queue-after-failure-thread';
+    const resourceId = 'queue-after-failure-user';
+    let sender: any;
+    const failAfterQueue = createTool({
+      id: 'fail_after_queue',
+      description: 'Queues a follow-up and then fails the active turn',
+      inputSchema: z.object({}),
+      execute: async () => {
+        const queued = sender.queueMessage(QUEUED_AFTER_FAILURE, { resourceId, threadId });
+        await queued.accepted;
+        throw new Error('active turn failed');
+      },
+    });
+    const memory = new MockMemory();
+    const shared = await createSharedAgent(getMock(), {
+      tools: { fail_after_queue: failAfterQueue },
+      memory,
+      engine,
+    });
+    sender = new Mastra({
+      agents: { sender: shared.agent.__fork() },
+      storage: shared.mastra.getStorage(),
+      pubsub: new EventEmitterPubSub(),
+      logger: false,
+    }).getAgent('sender');
+
+    const result = await runLoopScenario({
+      engine,
+      llm: getMock(),
+      prompt: 'Fail after queueing the follow-up.',
+      sharedAgent: shared,
+      memory,
+      threadId,
+      resourceId,
+      fixtures: llm => {
+        llm.on(
+          {
+            endpoint: 'chat',
+            hasToolResult: false,
+            predicate: request => !requestText(request).includes(QUEUED_AFTER_FAILURE),
+          },
+          { toolCalls: [{ id: 'call_fail_after_queue', name: 'fail_after_queue', arguments: {} }] },
+        );
+        llm.on(
+          { endpoint: 'chat', predicate: request => requestText(request).includes(QUEUED_AFTER_FAILURE) },
+          { content: 'queued turn recovered' },
+        );
+      },
+    });
+
+    expect(await result.output.finishReason).toBe('error');
+    await waitFor(() =>
+      getMock()
+        .getRequests()
+        .some(request => requestText(request).includes(QUEUED_AFTER_FAILURE)),
+    );
+    expect(
+      getMock()
+        .getRequests()
+        .some(request => requestText(request).includes(QUEUED_AFTER_FAILURE)),
+    ).toBe(true);
+  });
 
   it.each(engine === 'inngest' ? [false, true] : [false])(
     'holds a queued message until the active run completes, then runs it (remote sender: %s)',

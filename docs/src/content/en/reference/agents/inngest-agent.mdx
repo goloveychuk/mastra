@@ -413,7 +413,7 @@ Cancellation doesn't stop a turn that has already become active. Use `abortThrea
 
 Returns: `Promise<boolean>`
 
-Finds the active run through Inngest and sends its worker a graceful-abort request. Returns `false` if the thread has no active run. A `true` result means the request was published, not that the worker has finished stopping:
+Sends a durable abort command through the Inngest thread controller. The executing worker observes it at the next agent-loop boundary and finishes the run with an aborted result. Returns `false` if the thread has no active run; it does not wait for the worker to finish stopping:
 
 ```typescript
 await durableAgent.abortThreadStreamAsync({
