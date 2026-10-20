@@ -200,6 +200,10 @@ describe('Inngest agent shared thread output', () => {
             .map(chunk => chunk.payload.text)
             .join(''),
         ).toBe('stored once');
+        const inputChunks = chunks.filter(chunk => chunk.type === 'data-user-message');
+        expect(inputChunks).toHaveLength(1);
+        expect(inputChunks[0].data.contents).toBe('hi');
+        expect(chunks.indexOf(inputChunks[0])).toBeLessThan(chunks.findIndex(chunk => chunk.type === 'text-delta'));
         for (const spy of leaseSpies) expect(spy).not.toHaveBeenCalled();
         for (const spy of publishSpies) {
           expect(spy.mock.calls.some(([topic]) => topic.includes('owner-discovery'))).toBe(false);

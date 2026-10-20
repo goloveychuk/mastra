@@ -37,12 +37,13 @@
  */
 
 import type { Agent, AgentExecutionOptions, StructuredOutputOptions } from '@mastra/core/agent';
-import { createSignal } from '@mastra/core/agent';
+import { createSignal, mastraDBMessageToSignal } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
   agentThreadStreamRuntime,
   prepareForDurableExecution,
   createDurableAgentStream,
+  emitChunkEvent,
   emitErrorEvent,
   runDurableStreamUntilIdle,
   runResumeDurableStreamUntilIdle,
@@ -1245,7 +1246,18 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // Track the trigger promise on the registry so generate() can await suspend
       // snapshot persistence before returning.
       const workflowExecution = ready
-        .then(() => triggerWorkflow(runId, workflowInput, tracingOptions, streamOptions?.actor))
+        .then(async () => {
+          const inputMessageIds = preparation.messageList.makeMessageSourceChecker().input;
+          const userInputSignals = preparation.messageList.get.all
+            .db()
+            .filter(message => message.role === 'user' && inputMessageIds.has(message.id))
+            .map(message => mastraDBMessageToSignal({ ...message, type: 'user' }));
+          const inputSignals = [...(registryEntry.initialSignalEchoes?.splice(0) ?? []), ...userInputSignals];
+          for (const signal of inputSignals) {
+            await emitChunkEvent(getPubsub(), runId, signal.toDataPart());
+          }
+          await triggerWorkflow(runId, workflowInput, tracingOptions, streamOptions?.actor);
+        })
         .catch(error => {
           void emitError(runId, error);
         });
@@ -2119,7 +2131,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           streamOptions: serializeThreadStreamOptions(target.ifIdle?.streamOptions),
         });
         if (reply.error) throw new Error(reply.error);
-        if (reply.accepted) return reply.accepted;
+        if (reply.accepted) {
+          if (signal.type === 'user' && !reply.wake && reply.accepted.action === 'deliver' && reply.accepted.runId) {
+            await emitChunkEvent(getPubsub(), reply.accepted.runId, signal.toDataPart());
+          }
+          return reply.accepted;
+        }
         throw new Error('Inngest did not accept the signal');
       })();
       const persisted = accepted.then(() => undefined);
