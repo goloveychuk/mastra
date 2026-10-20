@@ -1,4 +1,5 @@
 import { buildDeferredStepFinishChunk } from '@internal/core/durable';
+import { createSignal } from '@mastra/core/agent';
 import {
   createDurableBackgroundTaskCheckStep,
   createDurableLLMExecutionStep,
@@ -41,6 +42,8 @@ import { z } from 'zod';
 
 import { init } from '../index';
 import type { InngestFlowControlConfig } from '../types';
+import { getThreadFunctions } from './thread-controller';
+import type { ThreadReply } from './thread-controller';
 
 // Suspended snapshots back human-in-the-loop resume. Terminal statuses are also
 // persisted so a finished run's snapshot replaces its stale suspended one and
@@ -380,10 +383,38 @@ export function createInngestDurableAgenticWorkflow(options: InngestDurableAgent
         }
 
         // Check if we should continue
-        const shouldContinue = state.lastStepResult?.isContinued === true;
+        let shouldContinue = state.lastStepResult?.isContinued === true;
         // Use maxSteps from options (per-request), falling back to workflow-level default
         const effectiveMaxSteps = state.options?.maxSteps ?? maxSteps;
         const underMaxSteps = state.iterationCount < effectiveMaxSteps;
+
+        const threadScope = (state.options as any)?.__inngestThreadScope;
+        if (threadScope && underMaxSteps) {
+          const reply = (await step.invoke(`drain-thread-${state.iterationCount}`, {
+            function: getThreadFunctions(inngest).command,
+            data: {
+              ...threadScope,
+              id: `${state.runId}:drain:${state.iterationCount}`,
+              operation: 'drain',
+              runId: state.runId,
+              closing: !shouldContinue,
+            },
+          })) as ThreadReply;
+          if (reply?.aborted) {
+            state.lastStepResult = {
+              ...(state.lastStepResult ?? { warnings: [] }),
+              reason: 'abort',
+              isContinued: false,
+            };
+            shouldContinue = false;
+          } else if (reply?.signals?.length) {
+            const messageList = new MessageList().deserialize(state.messageListState);
+            state.messageId = messageList.rotateResponseMessageId(state.messageId);
+            for (const input of reply.signals) messageList.addSignal(createSignal(input));
+            state.messageListState = messageList.serialize();
+            shouldContinue = true;
+          }
+        }
 
         if (!shouldContinue || !underMaxSteps) {
           await emitStepFinish(false);

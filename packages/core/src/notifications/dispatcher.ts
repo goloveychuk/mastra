@@ -13,6 +13,10 @@ import type { NotificationDeliveryDecision, NotificationDeliveryThreadState, Not
 type NotificationDispatchAgent = {
   id?: string;
   getPubSub?: () => PubSub | undefined;
+  __getThreadState?: (scope: {
+    resourceId?: string;
+    threadId: string;
+  }) => NotificationDeliveryThreadState | Promise<NotificationDeliveryThreadState>;
   sendSignal: (signal: CreatedAgentSignal, target: SendAgentSignalOptions) => SendAgentSignalResult;
   resolveNotificationDeliveryDecision?: (
     input: NotificationDeliveryPolicyInput,
@@ -169,10 +173,7 @@ async function sendNotificationRecord({
   const agent = (await mastra.getAgentById(current.agentId as never)) as NotificationDispatchAgent;
   const threadState =
     batchThreadState ??
-    agentThreadStreamRuntime.getThreadState(
-      { resourceId: current.resourceId, threadId: current.threadId },
-      agent.getPubSub?.(),
-    );
+    (await getAgentThreadState(agent, { resourceId: current.resourceId, threadId: current.threadId }));
   if (current.priority === 'high' && current.summarySignalId && threadState === 'active') return null;
 
   const signal = createNotificationSignal({
@@ -228,10 +229,7 @@ async function sendNotificationSummary({
   const agent = (await mastra.getAgentById(first.agentId as never)) as NotificationDispatchAgent;
   const decision = await resolveDeliveryTimeDecision(agent, {
     record: first,
-    threadState: agentThreadStreamRuntime.getThreadState(
-      { resourceId: first.resourceId, threadId: first.threadId },
-      agent.getPubSub?.(),
-    ),
+    threadState: await getAgentThreadState(agent, { resourceId: first.resourceId, threadId: first.threadId }),
     now,
   });
   if (decision.hold) return null;
@@ -289,10 +287,14 @@ async function getBatchThreadState({
   group: DueDispatchGroup;
 }): Promise<NotificationDeliveryThreadState> {
   const agent = (await mastra.getAgentById(group.agentId as never)) as NotificationDispatchAgent;
-  return agentThreadStreamRuntime.getThreadState(
-    { resourceId: group.resourceId, threadId: group.threadId },
-    agent.getPubSub?.(),
-  );
+  return getAgentThreadState(agent, { resourceId: group.resourceId, threadId: group.threadId });
+}
+
+function getAgentThreadState(
+  agent: NotificationDispatchAgent,
+  scope: { resourceId?: string; threadId: string },
+): NotificationDeliveryThreadState | Promise<NotificationDeliveryThreadState> {
+  return agent.__getThreadState?.(scope) ?? agentThreadStreamRuntime.getThreadState(scope, agent.getPubSub?.());
 }
 
 export async function dispatchDueNotifications({

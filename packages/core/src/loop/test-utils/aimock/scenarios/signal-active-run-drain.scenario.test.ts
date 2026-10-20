@@ -23,7 +23,11 @@
 import { stepCountIs } from '@internal/ai-sdk-v5';
 import { expect, it } from 'vitest';
 import { z } from 'zod/v4';
+import { EventEmitterPubSub } from '../../../../events/event-emitter';
+import { Mastra } from '../../../../mastra';
 import { MockMemory } from '../../../../memory/mock';
+import { InMemoryNotificationsStorage } from '../../../../notifications/storage';
+import { MastraCompositeStore } from '../../../../storage/base';
 import { createTool } from '../../../../tools';
 import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines, createSharedAgent } from '../aimock-scenario';
 
@@ -36,6 +40,142 @@ function requestText(request: any): string {
 
 describeForAllEngines('AIMock scenario: signal delivery into an active run', engine => {
   const getMock = useLoopScenarioAimock();
+
+  it.runIf(engine === 'inngest').each(['message', 'notification'] as const)(
+    'wakes an idle thread from a remote %s through Inngest',
+    async signalType => {
+      const memory = new MockMemory();
+      const shared = await createSharedAgent(getMock(), { engine, memory });
+      const sender = new Mastra({
+        agents: { sender: shared.agent.__fork() },
+        storage: new MastraCompositeStore({
+          id: 'idle-sender',
+          domains: { notifications: new InMemoryNotificationsStorage() },
+        }),
+        pubsub: new EventEmitterPubSub(),
+        logger: false,
+      }).getAgent('sender');
+      const target = { resourceId: 'remote-idle-user', threadId: `remote-idle-${signalType}` };
+      getMock().on({ endpoint: 'chat' }, { content: 'Native idle response' });
+      const sent =
+        signalType === 'message'
+          ? sender.sendMessage({ contents: INTERJECTION }, target)
+          : await sender.sendNotificationSignal(
+              { source: 'github', kind: 'ci-status', priority: 'urgent', summary: INTERJECTION },
+              target,
+            );
+      const accepted = await sent.accepted;
+      expect(accepted).toMatchObject({ action: 'deliver' });
+      if (!accepted || !('runId' in accepted)) throw new Error('Expected an accepted native run');
+      const observed = await (shared.agent as any).observe(accepted.runId);
+      try {
+        expect(await observed.output.text).toContain('Native idle response');
+        expect(requestText(getMock().getRequests()[0])).toContain(INTERJECTION);
+      } finally {
+        observed.cleanup();
+      }
+    },
+  );
+
+  it.runIf(engine === 'inngest').each(['message', 'state', 'notification', 'summary', 'rollover'] as const)(
+    'delivers %s steering from another pod without shared Mastra pubsub',
+    async signalType => {
+      const threadId = `cross-pod-drain-thread-${signalType}`;
+      const steeringContents = signalType === 'summary' ? 'github: 1' : INTERJECTION;
+      const resourceId = 'cross-pod-drain-user';
+      const acceptedResults: any[] = [];
+      let observedRunId: string | undefined;
+      let signalAgent: any;
+      let sent = false;
+      const doWork = createTool({
+        id: 'do_work',
+        description: 'Performs work while another pod receives steering',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute: async () => {
+          if (!sent) {
+            sent = true;
+            observedRunId = await signalAgent.getActiveThreadRunIdAsync({ resourceId, threadId });
+            if (signalType === 'rollover') {
+              for (let commandIndex = 0; commandIndex < 64; commandIndex++) {
+                expect(await signalAgent.getActiveThreadRunIdAsync({ resourceId, threadId })).toBe(observedRunId);
+              }
+            }
+            const result =
+              signalType === 'notification' || signalType === 'summary'
+                ? await signalAgent.sendNotificationSignal(
+                    {
+                      source: 'github',
+                      kind: 'ci-status',
+                      priority: signalType === 'summary' ? 'medium' : 'urgent',
+                      summary: INTERJECTION,
+                    },
+                    { resourceId, threadId },
+                  )
+                : signalType === 'state'
+                  ? await signalAgent.sendStateSignal(
+                      { id: 'browser', cacheKey: 'browser:v1', mode: 'snapshot', contents: INTERJECTION },
+                      { resourceId, threadId },
+                    )
+                  : signalAgent.sendMessage({ contents: INTERJECTION }, { resourceId, threadId });
+            acceptedResults.push(await result.accepted);
+          }
+          return { ok: true };
+        },
+      });
+      const memory = new MockMemory();
+      const shared = await createSharedAgent(getMock(), { tools: { do_work: doWork }, memory, engine });
+      const senderMastra = new Mastra({
+        agents: { sender: shared.agent.__fork() },
+        storage:
+          signalType === 'notification' || signalType === 'summary'
+            ? new MastraCompositeStore({
+                id: 'sender-notifications',
+                domains: { notifications: new InMemoryNotificationsStorage() },
+              })
+            : shared.mastra.getStorage(),
+        pubsub: new EventEmitterPubSub(),
+        logger: false,
+      });
+      signalAgent = senderMastra.getAgent('sender');
+      expect(signalAgent.getPubSub()).not.toBe(shared.agent.getPubSub());
+
+      const { output, requests } = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        prompt: 'Please do the work.',
+        sharedAgent: shared,
+        memory,
+        threadId,
+        resourceId,
+        stopWhen: stepCountIs(5),
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', hasToolResult: false },
+            { toolCalls: [{ id: 'call_work', name: 'do_work', arguments: {} }] },
+          );
+          llm.on(
+            { endpoint: 'chat', predicate: req => JSON.stringify(req).includes(steeringContents) },
+            { content: 'drained response' },
+          );
+          llm.on(
+            {
+              endpoint: 'chat',
+              hasToolResult: true,
+              predicate: req => !JSON.stringify(req).includes(steeringContents),
+            },
+            { content: 'pre-drain response' },
+          );
+        },
+      });
+
+      expect(acceptedResults.map(result => result.action)).toEqual(['deliver']);
+      expect(observedRunId).toBe(output.runId);
+      expect(requests.slice(1).some(request => requestText(request).includes(steeringContents))).toBe(true);
+      expect(await output.text).toContain('drained response');
+    },
+    120_000,
+  );
 
   it('delivers a sendMessage into the active run and drains it in the same run', async () => {
     const threadId = 'active-drain-thread';

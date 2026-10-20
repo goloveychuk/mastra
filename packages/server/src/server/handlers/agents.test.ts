@@ -4238,6 +4238,64 @@ describe('Agent Routes Authorization', () => {
       },
     );
 
+    it('prefers the durable abort API when the agent provides one', async () => {
+      await mockMemory.createThread({
+        threadId: 'abort-thread-native-control',
+        resourceId: 'user-a',
+        title: 'Abort Thread',
+      });
+      const abortThreadStream = vi.spyOn(mockAgent, 'abortThreadStream');
+      const abortThreadStreamAsync = vi.fn().mockResolvedValue(true);
+      (mockAgent as any).abortThreadStreamAsync = abortThreadStreamAsync;
+
+      await expect(
+        ABORT_AGENT_THREAD_ROUTE.handler({
+          mastra,
+          agentId: 'test-agent',
+          requestContext: createContextWithReservedKeys({ resourceId: 'user-a' }),
+          resourceId: 'user-a',
+          threadId: 'abort-thread-native-control',
+          abortSignal: new AbortController().signal,
+        } as any),
+      ).resolves.toEqual({ aborted: true });
+
+      expect(abortThreadStreamAsync).toHaveBeenCalledWith({
+        resourceId: 'user-a',
+        threadId: 'abort-thread-native-control',
+      });
+      expect(abortThreadStream).not.toHaveBeenCalled();
+    });
+
+    it('prefers the durable cancellation API when the agent provides one', async () => {
+      await mockMemory.createThread({
+        threadId: 'cancel-thread-native-control',
+        resourceId: 'user-a',
+        title: 'Cancel Thread',
+      });
+      const cancelQueuedMessages = vi.spyOn(mockAgent, 'cancelQueuedMessages');
+      const cancelQueuedMessagesAsync = vi.fn().mockResolvedValue({ cancelledSignalIds: ['native-signal'] });
+      (mockAgent as any).cancelQueuedMessagesAsync = cancelQueuedMessagesAsync;
+
+      await expect(
+        CANCEL_AGENT_PENDING_SIGNALS_ROUTE.handler({
+          mastra,
+          agentId: 'test-agent',
+          requestContext: createContextWithReservedKeys({ resourceId: 'user-a' }),
+          resourceId: 'user-a',
+          threadId: 'cancel-thread-native-control',
+          signalIds: ['native-signal'],
+          abortSignal: new AbortController().signal,
+        } as any),
+      ).resolves.toEqual({ cancelledSignalIds: ['native-signal'] });
+
+      expect(cancelQueuedMessagesAsync).toHaveBeenCalledWith({
+        resourceId: 'user-a',
+        threadId: 'cancel-thread-native-control',
+        signalIds: ['native-signal'],
+      });
+      expect(cancelQueuedMessages).not.toHaveBeenCalled();
+    });
+
     it.each(
       (['cancel', 'abort'] as const).flatMap(operation =>
         (['owned', 'unscoped', 'missing', 'no-memory'] as const).flatMap(scope =>

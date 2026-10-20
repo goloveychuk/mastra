@@ -1,6 +1,6 @@
 import { Agent } from '@mastra/core/agent';
 import { Inngest } from 'inngest';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { createInngestAgent } from './durable-agent/create-inngest-agent';
@@ -37,6 +37,36 @@ const optsOf = (fn: unknown) => (fn as { opts: { retries?: number } }).opts;
 describe('Inngest function-level retries', () => {
   it('defaults to 0 for the event-triggered function', () => {
     expect(optsOf(build().getFunction()).retries).toBe(0);
+  });
+
+  it('registers a failure handler for event-triggered workflows', () => {
+    expect((build().getFunction() as { opts: { onFailure?: unknown } }).opts.onFailure).toBeTypeOf('function');
+  });
+
+  it('completes a failed durable thread through the controller', async () => {
+    const loop = createInngestDurableAgenticWorkflow({ inngest }) as InngestWorkflow;
+    const onFailure = (loop.getFunction() as { opts: { onFailure: (context: any) => Promise<void> } }).opts.onFailure;
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const scope = { agentId: 'agent-id', resourceId: 'resource-id', threadId: 'thread-id' };
+
+    await onFailure({
+      event: {
+        data: {
+          event: {
+            data: {
+              inputData: { options: { __inngestThreadScope: scope } },
+              runId: 'failed-run',
+            },
+          },
+        },
+      },
+      step: { invoke },
+    });
+
+    expect(invoke).toHaveBeenCalledWith('complete-agent-thread-on-failure', {
+      function: expect.anything(),
+      data: { ...scope, id: 'failed-run:complete', operation: 'complete', runId: 'failed-run' },
+    });
   });
 
   it('forwards configured retries to the event-triggered function', () => {

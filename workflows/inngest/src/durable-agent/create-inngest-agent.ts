@@ -37,11 +37,13 @@
  */
 
 import type { Agent, AgentExecutionOptions, StructuredOutputOptions } from '@mastra/core/agent';
+import { createSignal, mastraDBMessageToSignal } from '@mastra/core/agent';
 import {
   AGENT_STREAM_TOPIC,
   agentThreadStreamRuntime,
   prepareForDurableExecution,
   createDurableAgentStream,
+  emitChunkEvent,
   emitErrorEvent,
   runDurableStreamUntilIdle,
   runResumeDurableStreamUntilIdle,
@@ -57,7 +59,7 @@ import type { ActorSignal } from '@mastra/core/auth/ee';
 import { InMemoryServerCache } from '@mastra/core/cache';
 import type { MastraServerCache } from '@mastra/core/cache';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
-import { CachingPubSub, PubSub } from '@mastra/core/events';
+import { CachingPubSub, EventEmitterPubSub, PubSub } from '@mastra/core/events';
 import type { Event, EventCallback, SubscribeOptions } from '@mastra/core/events';
 import type { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
@@ -71,12 +73,97 @@ import {
   buildDurableResumeEventData,
   buildDurableTriggerEventData,
   mergeResumeRequestContext,
+  serializeRequestContext,
 } from '../durable-event-payload';
 import { InngestPubSub } from '../pubsub';
 import type { InngestFlowControlConfig } from '../types';
 import type { InngestWorkflow } from '../workflow';
 import { createInngestDurableAgenticWorkflow, InngestDurableStepIds } from './create-inngest-agentic-workflow';
 import { keepSuspendedRunScopes } from './resume-scopes';
+import { requestThreadCommand, serializeThreadSignal } from './thread-controller';
+
+const THREAD_OUTPUT_EVENTS = new Set([
+  'run-registered',
+  'stream-part',
+  'run-completed',
+  'run-suspended',
+  'run-discarded',
+  'run-aborted',
+  'run-failed',
+]);
+
+class InngestThreadOutputPubSub extends PubSub {
+  private readonly local = new EventEmitterPubSub();
+  private readonly callbacks = new Map<string, Map<EventCallback, EventCallback>>();
+
+  constructor(private readonly output: PubSub) {
+    super();
+  }
+
+  private isThreadTopic(topic: string): boolean {
+    return topic.startsWith('agent.thread-stream.');
+  }
+
+  publish(topic: string, event: Omit<Event, 'id' | 'createdAt'>, options?: { localOnly?: boolean }): Promise<void> {
+    if (this.isThreadTopic(topic) && THREAD_OUTPUT_EVENTS.has(event.type)) {
+      return this.output.publish(topic, event, options);
+    }
+    return this.local.publish(topic, event, options);
+  }
+
+  async subscribe(topic: string, cb: EventCallback, options?: SubscribeOptions): Promise<void> {
+    await this.local.subscribe(topic, cb, options);
+    if (!this.isThreadTopic(topic)) return;
+    let callbacks = this.callbacks.get(topic);
+    if (!callbacks) {
+      callbacks = new Map();
+      this.callbacks.set(topic, callbacks);
+    }
+    if (callbacks.has(cb)) return;
+    const sharedCallback: EventCallback = async (event, ack) => {
+      if (THREAD_OUTPUT_EVENTS.has(event.type)) await cb(event, ack);
+      else await ack?.();
+    };
+    callbacks.set(cb, sharedCallback);
+    try {
+      await this.output.subscribe(topic, sharedCallback, options);
+    } catch (error) {
+      callbacks.delete(cb);
+      if (callbacks.size === 0) this.callbacks.delete(topic);
+      await this.local.unsubscribe(topic, cb);
+      throw error;
+    }
+  }
+
+  async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
+    const callbacks = this.callbacks.get(topic);
+    const sharedCallback = callbacks?.get(cb);
+    callbacks?.delete(cb);
+    if (callbacks?.size === 0) this.callbacks.delete(topic);
+    await Promise.all([
+      this.local.unsubscribe(topic, cb),
+      ...(sharedCallback ? [this.output.unsubscribe(topic, sharedCallback)] : []),
+    ]);
+  }
+
+  async flush(): Promise<void> {
+    await Promise.all([this.local.flush(), this.output.flush()]);
+  }
+
+  async getHistory(topic: string, offset?: number): Promise<Event[]> {
+    if (!this.isThreadTopic(topic)) return this.local.getHistory(topic, offset);
+    return (await this.output.getHistory(topic, offset)).filter(event => THREAD_OUTPUT_EVENTS.has(event.type));
+  }
+
+  async clearTopic(topic: string): Promise<void> {
+    await this.local.clearTopic(topic);
+    if (this.isThreadTopic(topic)) await this.output.clearTopic(topic);
+  }
+
+  trimTopic(topic: string, options: { runId: string; producedBefore?: number }): Promise<void> {
+    return this.isThreadTopic(topic) ? this.output.trimTopic(topic, options) : this.local.trimTopic(topic, options);
+  }
+}
 
 class InngestAgentPubSubRouter extends PubSub {
   constructor(
@@ -606,23 +693,38 @@ export interface InngestAgent<TOutput = undefined> {
   /** Get raw agent configuration. Forwarded to the underlying Agent. */
   toRawConfig(...args: any[]): any;
   /**
-   * Send a signal to a thread. Forwarded to the underlying Agent; a signal that
-   * wakes an idle thread starts the run through this agent's durable `stream()`.
+   * Route a signal through Inngest. Requires both resourceId and threadId.
    */
   sendSignal: Agent<any, any, TOutput>['sendSignal'];
-  /** Send a state signal to a thread. Forwarded to the underlying Agent. */
+  /** Send a message through Inngest-owned thread routing. */
+  sendMessage: Agent<any, any, TOutput>['sendMessage'];
+  queueMessage: Agent<any, any, TOutput>['queueMessage'];
+  queueSignal: Agent<any, any, TOutput>['queueSignal'];
   sendStateSignal: Agent<any, any, TOutput>['sendStateSignal'];
   /** Send a notification signal to a thread. Forwarded to the underlying Agent. */
   sendNotificationSignal: Agent<any, any, TOutput>['sendNotificationSignal'];
-  /** Subscribe to a thread's runs. Forwarded to the underlying Agent. */
+  /** Subscribe to thread output; cross-worker delivery requires a shared custom PubSub. */
   subscribeToThread: Agent<any, any, TOutput>['subscribeToThread'];
-  /** Get the active run id for a thread. Forwarded to the underlying Agent. */
+  /** Get a locally known run id. Use getActiveThreadRunIdAsync() across workers. */
   getActiveThreadRunId: Agent<any, any, TOutput>['getActiveThreadRunId'];
+  getActiveThreadRunIdAsync(target: { resourceId?: string; threadId: string }): Promise<string | undefined>;
+  __getThreadState: Agent<any, any, TOutput>['__getThreadState'];
+  cancelQueuedMessages: Agent<any, any, TOutput>['cancelQueuedMessages'];
+  cancelQueuedMessagesAsync(
+    target: Parameters<Agent<any, any, TOutput>['cancelQueuedMessages']>[0],
+  ): Promise<ReturnType<Agent<any, any, TOutput>['cancelQueuedMessages']>>;
+  getPubSub(): PubSub;
   /**
    * Abort the thread's active run, including on the Inngest worker executing it.
    * Returns `false` when there is no matching active run.
    */
   abortThreadStream: Agent<any, any, TOutput>['abortThreadStream'];
+  abortThreadStreamAsync(target: {
+    resourceId: string;
+    threadId: string;
+    clearPendingSignals?: boolean;
+    expectedRunId?: string;
+  }): Promise<boolean>;
   /** Abort a run by id, including on the Inngest worker executing it. */
   abortRunStream: Agent<any, any, TOutput>['abortRunStream'];
   /**
@@ -749,6 +851,14 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
   // Active untilIdle wrappers keyed by scope (threadId|resourceId)
   const activeStreamUntilIdle = new Map<string, () => void>();
+  const localThreadPubsub = customPubsub ? new InngestThreadOutputPubSub(customPubsub) : new EventEmitterPubSub();
+
+  const serializeThreadStreamOptions = (
+    streamOptions?: AgentExecutionOptions<any>,
+  ): Record<string, unknown> | undefined =>
+    streamOptions
+      ? { ...streamOptions, requestContext: serializeRequestContext(streamOptions.requestContext) }
+      : undefined;
 
   // Late-bound reference to the proxy so stream() can pass it to runDurableStreamUntilIdle
   let proxyRef: InngestAgent<TOutput> | undefined;
@@ -951,9 +1061,21 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     | 'approveToolCall'
     | 'declineToolCall'
     | 'sendToolApproval'
+    | 'sendSignal'
+    | 'sendMessage'
+    | 'queueMessage'
+    | 'queueSignal'
+    | 'getPubSub'
+    | 'getActiveThreadRunId'
+    | 'getActiveThreadRunIdAsync'
+    | '__getThreadState'
+    | 'cancelQueuedMessages'
+    | 'cancelQueuedMessagesAsync'
+    | 'subscribeToThread'
     | 'approveToolCallGenerate'
     | 'declineToolCallGenerate'
     | 'abortThreadStream'
+    | 'abortThreadStreamAsync'
     | 'abortRunStream'
     | '__fork'
     | 'getDurableWorkflows'
@@ -1019,10 +1141,15 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       });
 
       const { runId, messageId, workflowInput, registryEntry, threadId, resourceId } = preparation;
+      registryEntry.drainPendingSignals = undefined;
+      registryEntry.subscribePendingSignals = undefined;
 
       // Override agentId and agentName in workflowInput with the durable agent's values
       workflowInput.agentId = agentId;
       workflowInput.agentName = agentName;
+      if (threadId && resourceId) {
+        (workflowInput.options as any).__inngestThreadScope = { agentId, threadId, resourceId };
+      }
 
       // 1a. Install abort controller for this run. The controller is owned by
       // this InngestAgent instance; `result.abort()` flips it, the durable
@@ -1119,7 +1246,18 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // Track the trigger promise on the registry so generate() can await suspend
       // snapshot persistence before returning.
       const workflowExecution = ready
-        .then(() => triggerWorkflow(runId, workflowInput, tracingOptions, streamOptions?.actor))
+        .then(async () => {
+          const inputMessageIds = preparation.messageList.makeMessageSourceChecker().input;
+          const userInputSignals = preparation.messageList.get.all
+            .db()
+            .filter(message => message.role === 'user' && inputMessageIds.has(message.id))
+            .map(message => mastraDBMessageToSignal({ ...message, type: 'user' }));
+          const inputSignals = [...(registryEntry.initialSignalEchoes?.splice(0) ?? []), ...userInputSignals];
+          for (const signal of inputSignals) {
+            await emitChunkEvent(getPubsub(), runId, signal.toDataPart());
+          }
+          await triggerWorkflow(runId, workflowInput, tracingOptions, streamOptions?.actor);
+        })
         .catch(error => {
           void emitError(runId, error);
         });
@@ -1128,16 +1266,11 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         trackedEntry.workflowExecution = workflowExecution;
       }
 
-      // 3b. Register with the thread-stream runtime under the durable wrapper's
-      // identity, mirroring DurableAgent. This lets subscribeToThread /
-      // sendSignal find the run, and releases the thread reservation held by a
-      // signal-woken run once the durable stream finishes. Uses the Mastra-level
-      // pubsub (agent.getPubSub()) — not the CachingPubSub carrying workflow chunks.
       await agentThreadStreamRuntime.registerRun(
         proxyRef as unknown as Agent<any, any, any, any>,
         output,
         (streamOptions ?? {}) as AgentExecutionOptions<TOutput>,
-        agent.getPubSub(),
+        localThreadPubsub,
         streamOptions?.closeOnSuspend ? undefined : { continuation: 'across-suspension' },
       );
 
@@ -1358,7 +1491,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       let notResumable = false;
       const didThreadRunPublishTerminal = agentThreadStreamRuntime.captureThreadRunTerminalPublish(
         runId,
-        agent.getPubSub(),
+        localThreadPubsub,
       );
 
       const dispatch = ready.then(async () => {
@@ -1493,7 +1626,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         proxyRef as unknown as Agent<any, any, any, any>,
         output,
         resumeStreamOptions,
-        agent.getPubSub(),
+        localThreadPubsub,
       );
       const terminalPublishedDuringDispatch = !resumeOptions?.closeOnSuspend && didThreadRunPublishTerminal?.();
       if (!continued && !terminalPublishedDuringDispatch) {
@@ -1501,7 +1634,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           proxyRef as unknown as Agent<any, any, any, any>,
           output,
           resumeStreamOptions,
-          agent.getPubSub(),
+          localThreadPubsub,
           resumeOptions?.closeOnSuspend ? undefined : { continuation: 'across-suspension' },
         );
       }
@@ -1549,6 +1682,15 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // Override with durable agent's id/name
       preparation.workflowInput.agentId = agentId;
       preparation.workflowInput.agentName = agentName;
+      preparation.registryEntry.drainPendingSignals = undefined;
+      preparation.registryEntry.subscribePendingSignals = undefined;
+      if (preparation.threadId && preparation.resourceId) {
+        (preparation.workflowInput.options as any).__inngestThreadScope = {
+          agentId,
+          threadId: preparation.threadId,
+          resourceId: preparation.resourceId,
+        };
+      }
 
       return {
         runId: preparation.runId,
@@ -1772,12 +1914,12 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
               executionOptions as Record<string, any>,
             ) as AgentExecutionOptions<any>,
           },
-          agent.getPubSub(),
+          localThreadPubsub,
         );
         return { accepted: continuation.accepted, runId: continuation.runId, toolCallId: options.toolCallId };
       }
 
-      let runId = executionOptions.runId ?? agent.getActiveThreadRunId({ threadId, resourceId });
+      let runId = executionOptions.runId ?? proxyRef!.getActiveThreadRunId({ threadId, resourceId });
       let suspendedRun: Awaited<ReturnType<typeof agent.listSuspendedRuns>>['runs'][number] | undefined;
       if (!runId) {
         // listSuspendedRuns also queries this agent's durableLoopWorkflowName.
@@ -1826,7 +1968,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
       const inMemorySuspension = agentThreadStreamRuntime.getResumableThreadRunSuspension(
         { threadId, resourceId, runId, toolCallId: options.toolCallId },
-        agent.getPubSub(),
+        localThreadPubsub,
       );
       if (!suspendedRun && !inMemorySuspension) {
         let storageUnavailable = false;
@@ -1920,6 +2062,125 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       return { accepted: true, runId, toolCallId: options.toolCallId };
     },
 
+    getPubSub() {
+      return localThreadPubsub;
+    },
+
+    getActiveThreadRunId(target) {
+      return agentThreadStreamRuntime.getActiveThreadRunId(target, localThreadPubsub);
+    },
+
+    async getActiveThreadRunIdAsync(target) {
+      if (!target.resourceId) throw new Error('Inngest thread lookup requires resourceId and threadId');
+      const reply = await requestThreadCommand(inngest, {
+        ...target,
+        resourceId: target.resourceId,
+        id: crypto.randomUUID(),
+        operation: 'lookup',
+        agentId,
+      });
+      if (reply.error) throw new Error(reply.error);
+      return reply.runId;
+    },
+
+    async __getThreadState(target) {
+      return (await proxyRef!.getActiveThreadRunIdAsync(target)) ? 'active' : 'idle';
+    },
+
+    cancelQueuedMessages(target) {
+      return agentThreadStreamRuntime.cancelQueuedMessages(proxyRef as unknown as Agent, target, localThreadPubsub);
+    },
+
+    async cancelQueuedMessagesAsync(target) {
+      if (!target.resourceId) throw new Error('Inngest queue cancellation requires resourceId and threadId');
+      if (Array.isArray(target.signalIds) === (typeof target.queueOwnerId === 'string')) {
+        throw new Error('cancelQueuedMessagesAsync requires exactly one of signalIds or queueOwnerId');
+      }
+      const reply = await requestThreadCommand(inngest, {
+        ...target,
+        resourceId: target.resourceId,
+        id: crypto.randomUUID(),
+        operation: 'cancel',
+        agentId,
+      });
+      if (reply.error) throw new Error(reply.error);
+      return { cancelledSignalIds: reply.cancelledSignalIds ?? [] };
+    },
+
+    subscribeToThread(target: any) {
+      return agentThreadStreamRuntime.subscribeToThread(proxyRef as unknown as Agent, target, localThreadPubsub);
+    },
+
+    sendSignal(signalInput, target) {
+      const signal = createSignal(signalInput);
+      const accepted = (async () => {
+        if (!target.resourceId || !target.threadId) {
+          throw new Error('Inngest steering requires resourceId and threadId');
+        }
+        const reply = await requestThreadCommand(inngest, {
+          id: signal.id,
+          operation: 'send',
+          agentId,
+          resourceId: target.resourceId,
+          threadId: target.threadId,
+          runId: target.runId,
+          signal: serializeThreadSignal(signal),
+          nextRunId: crypto.randomUUID(),
+          ifActive: target.ifActive,
+          ifIdle: target.ifIdle,
+          streamOptions: serializeThreadStreamOptions(target.ifIdle?.streamOptions),
+        });
+        if (reply.error) throw new Error(reply.error);
+        if (reply.accepted) {
+          if (signal.type === 'user' && !reply.wake && reply.accepted.action === 'deliver' && reply.accepted.runId) {
+            await emitChunkEvent(getPubsub(), reply.accepted.runId, signal.toDataPart());
+          }
+          return reply.accepted;
+        }
+        throw new Error('Inngest did not accept the signal');
+      })();
+      const persisted = accepted.then(() => undefined);
+      void persisted.catch(() => undefined);
+      return { signal, accepted, persisted };
+    },
+
+    sendMessage(message, target) {
+      const input = typeof message === 'object' && !Array.isArray(message) ? message : { contents: message };
+      return proxyRef!.sendSignal({ type: 'user-message', ...input }, target);
+    },
+
+    queueSignal(signalInput, target) {
+      const signal = createSignal(signalInput);
+      const accepted = (async () => {
+        if (!target.resourceId || !target.threadId) throw new Error('Inngest queues require resourceId and threadId');
+        const reply = await requestThreadCommand(inngest, {
+          id: signal.id,
+          operation: 'queue',
+          agentId,
+          resourceId: target.resourceId,
+          threadId: target.threadId,
+          runId: target.runId,
+          signal: serializeThreadSignal(signal),
+          nextRunId: crypto.randomUUID(),
+          ifActive: target.ifActive,
+          ifIdle: target.ifIdle,
+          streamOptions: serializeThreadStreamOptions(target.ifIdle?.streamOptions),
+          queueOwnerId: target.queueOwnerId,
+        });
+        if (reply.error) throw new Error(reply.error);
+        if (!reply.accepted) throw new Error('Inngest did not accept the queued signal');
+        return reply.accepted;
+      })();
+      const persisted = accepted.then(() => undefined);
+      void persisted.catch(() => undefined);
+      return { signal, accepted, persisted };
+    },
+
+    queueMessage(message, target) {
+      const input = typeof message === 'object' && !Array.isArray(message) ? message : { contents: message };
+      return proxyRef!.queueSignal({ type: 'user-message', ...input }, target);
+    },
+
     async approveToolCallGenerate(options) {
       const { runId, ...resumeOptions } = options;
       if (!runId) {
@@ -1950,16 +2211,30 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     abortThreadStream(abortOptions) {
       // Resolve the run before the base call: aborting releases the thread
       // lease, after which the thread no longer has an active run to look up.
-      const runId = agent.getActiveThreadRunId(abortOptions);
-      const aborted = agent.abortThreadStream(abortOptions);
+      const runId = proxyRef!.getActiveThreadRunId(abortOptions);
+      const aborted = agentThreadStreamRuntime.abortThread(abortOptions, localThreadPubsub);
       if (!aborted || !runId) return aborted;
 
       abortDurableRun(runId);
       return true;
     },
 
+    async abortThreadStreamAsync(target) {
+      const reply = await requestThreadCommand(inngest, {
+        id: crypto.randomUUID(),
+        operation: 'abort',
+        agentId,
+        resourceId: target.resourceId,
+        threadId: target.threadId,
+        ...(target.expectedRunId === undefined ? {} : { expectedRunId: target.expectedRunId }),
+        ...(target.clearPendingSignals === undefined ? {} : { clearPendingSignals: target.clearPendingSignals }),
+      });
+      if (reply.error) throw new Error(reply.error);
+      return reply.aborted === true;
+    },
+
     abortRunStream(runId) {
-      const aborted = agent.abortRunStream(runId);
+      const aborted = agentThreadStreamRuntime.abortRun(runId, localThreadPubsub);
       // Publish regardless of local knowledge: the run is normally executing
       // on an Inngest worker this process cannot see.
       abortDurableRun(runId);
@@ -2018,10 +2293,6 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
 
   // Assign the late-bound reference so stream()'s untilIdle path can use it
   proxyRef = result;
-  // Signal, message, and subscription APIs are forwarded to the wrapped agent
-  // by the Proxy above, and the thread-stream runtime wakes idle threads with
-  // `agent.stream()`. Point the runtime at the proxy so those wakes take the
-  // durable path instead of the wrapped agent's in-process stream().
   agent.__setThreadRuntimeAgent(result as unknown as Agent<any, any, any, any>);
   return result;
 }

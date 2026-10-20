@@ -36,7 +36,12 @@ describe('collectInngestFunctions()', () => {
 
     const functions = collectInngestFunctions({ mastra });
 
-    expect(functions).toEqual(originalFunctions);
+    expect(functions).toEqual(expect.arrayContaining(originalFunctions));
+    expect(functions.filter(fn => !originalFunctions.includes(fn)).map(fn => fn.id())).toEqual([
+      'mastra-thread-controller',
+      'mastra-thread-continuation',
+      'mastra-thread-command',
+    ]);
     expect(workflow.__getPubsubFactory()).toBeTypeOf('function');
   });
 
@@ -54,7 +59,9 @@ describe('collectInngestFunctions()', () => {
 
     const functions = collectInngestFunctions({ mastra });
 
-    expect(functions).toEqual(firstFunctions);
+    expect(functions).toEqual(expect.arrayContaining(firstFunctions));
+    expect(new Set(functions.map(fn => fn.id())).size).toBe(firstFunctions.length + 3);
+    expect(functions).toHaveLength(firstFunctions.length + 3);
     expect(firstWorkflows).toHaveBeenCalledOnce();
     expect(secondWorkflows).not.toHaveBeenCalled();
   });

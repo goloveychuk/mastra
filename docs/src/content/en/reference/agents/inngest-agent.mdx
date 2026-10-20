@@ -139,7 +139,7 @@ Returns: [`InngestAgent`](#inngestagent-interface)
 
 ## `InngestAgent` interface
 
-The object returned by `createInngestAgent()`. It provides the durable execution methods below. Any property or method not explicitly defined (e.g., `listTools()` and `getMemory()`) is forwarded to the underlying agent via a Proxy. Thread APIs such as `sendSignal()`, `sendStateSignal()`, `sendNotificationSignal()`, and `subscribeToThread()` are forwarded too, but a signal that wakes an idle thread starts the run through the durable `stream()`.
+The object returned by `createInngestAgent()`. It provides the durable execution methods below. Any property or method not explicitly defined (e.g., `listTools()` and `getMemory()`) is forwarded to the underlying agent via a Proxy. Thread signals and queued messages use Inngest-owned routing instead of Mastra PubSub ownership or queue coordination.
 
 ### Properties
 
@@ -342,6 +342,91 @@ interface PrepareResult {
   resourceId?: string
 }
 ```
+
+### Thread signals and queues
+
+Inngest serializes commands for each resource and thread. A native controller tracks the active run, pending signals, and queued turns through Inngest step replay. The functions are registered automatically by `serve()` and `connect()`.
+
+Both `resourceId` and `threadId` are required for Inngest signals, queues, and asynchronous controls. A `runId` alone isn't sufficient. All workers must register the same agent IDs and serve the same Inngest application. A thread has one active agent run at a time, including while that run is suspended.
+
+This routing uses Inngest's experimental signal APIs. Run-level stream output and command acknowledgements use Inngest Realtime by default. You don't need a shared Mastra PubSub adapter for thread ownership or queues. Shared memory and workflow snapshot storage are still needed for conversation history and suspension/resume.
+
+#### `sendSignal(signal, target)` and `sendMessage(message, target)`
+
+Send input to an active run, or start a durable run when the thread is idle:
+
+```typescript
+const target = { resourceId: 'user-1', threadId: 'thread-1' }
+const result = durableAgent.sendMessage('Include the latest results', target)
+const accepted = await result.accepted
+```
+
+An active run drains delivered signals between iterations. If the run is finishing, the controller holds new input for a later turn. Successful delivery returns `{ action: 'deliver', runId }`, including when a worker starts an idle thread. It doesn't return an in-process output handle. Use `observe(runId)` to read that run's stream.
+
+`sendStateSignal()` and `sendNotificationSignal()` use the same native routing after applying their state or notification policies. Notification policies resolve active/idle state through Inngest, including when the sender is on another worker. Explicit `persist` and `discard` behaviors don't start a run.
+
+#### `queueSignal(signal, target)` and `queueMessage(message, target)`
+
+Reserve a separate turn without interrupting the active run:
+
+```typescript
+const queued = durableAgent.queueMessage('Run the follow-up report', {
+  resourceId: 'user-1',
+  threadId: 'thread-1',
+  queueOwnerId: 'reports',
+})
+await queued.accepted
+```
+
+The controller starts queued turns in order after the current run finishes. Suspending the current run doesn't advance the queue; it advances when the resumed run finishes. A queued turn carries `ifIdle.streamOptions` to its worker. Request context is serialized and reconstructed there, without the framework-managed bearer token. Register tools and execution defaults on the agent; functions and other process-local values can't travel with a queued turn.
+
+#### `getActiveThreadRunIdAsync(target)`
+
+Returns: `Promise<string | undefined>`
+
+Queries the native controller for the thread's active run, including a run executing on another worker:
+
+```typescript
+const runId = await durableAgent.getActiveThreadRunIdAsync({
+  resourceId: 'user-1',
+  threadId: 'thread-1',
+})
+```
+
+#### `cancelQueuedMessagesAsync(target)`
+
+Returns: `Promise<{ cancelledSignalIds: string[] }>`
+
+Cancel selected pending signals using `signalIds`, or this agent's queued messages using `queueOwnerId`. Supply exactly one selector:
+
+```typescript
+const cancelled = await durableAgent.cancelQueuedMessagesAsync({
+  resourceId: 'user-1',
+  threadId: 'thread-1',
+  queueOwnerId: 'reports',
+})
+```
+
+Cancellation doesn't stop a turn that has already become active. Use `abortThreadStreamAsync()` to request that the active run stop.
+
+#### `abortThreadStreamAsync(target)`
+
+Returns: `Promise<boolean>`
+
+Sends a durable abort command through the Inngest thread controller. The executing worker observes it at the next agent-loop boundary and finishes the run with an aborted result. Returns `false` if the thread has no active run; it does not wait for the worker to finish stopping:
+
+```typescript
+await durableAgent.abortThreadStreamAsync({
+  resourceId: 'user-1',
+  threadId: 'thread-1',
+})
+```
+
+The synchronous `getActiveThreadRunId()`, `cancelQueuedMessages()`, and `abortThreadStream()` helpers consult this wrapper's local runtime, not the native controller. Use their asynchronous counterparts for cross-worker controls.
+
+`subscribeToThread()` can receive output from other instances when you pass a shared `pubsub`, such as [`RedisStreamsPubSub`](/reference/pubsub/redis-streams), to `createInngestAgent()`. The adapter shares stream parts and output lifecycle events through that transport. It doesn't use the shared transport's leases, owner discovery, or signal queues. Inngest still owns steering and run coordination.
+
+Without a shared custom `pubsub`, thread subscriptions remain local to the instance that starts the stream. Use `observe(runId)` for cross-worker run output over the default Inngest transport.
 
 ### Introspection
 

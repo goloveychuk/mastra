@@ -19,6 +19,7 @@ import type {
 } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
+import { getThreadFunctions } from './durable-agent/thread-controller';
 import { InngestExecutionEngine } from './execution-engine';
 import {
   compactNestedWorkflowResult,
@@ -456,6 +457,21 @@ export class InngestWorkflow<
         // `Run.cancel()` sends the same field.
         cancelOn: [{ event: `cancel.workflow.${this.id}`, match: 'data.runId' }],
         triggers: { event: `workflow.${this.id}` },
+        onFailure: async ({ event, step }: any) => {
+          if (this.id !== 'inngest:durable-agentic-loop') return;
+          const failedInput = event.data?.event?.data;
+          const threadScope = failedInput?.inputData?.options?.__inngestThreadScope;
+          if (!threadScope || !failedInput?.runId) return;
+          await step.invoke('complete-agent-thread-on-failure', {
+            function: getThreadFunctions(this.inngest).command,
+            data: {
+              ...threadScope,
+              id: `${failedInput.runId}:complete`,
+              operation: 'complete',
+              runId: failedInput.runId,
+            },
+          });
+        },
         // Spread flow control configuration
         ...this.flowControlConfig,
       },
@@ -560,8 +576,18 @@ export class InngestWorkflow<
 
         const engine = new InngestExecutionEngine(this.#mastra, step, attempt, this.options, parentStream);
 
+        const threadScope =
+          inputData?.options?.__inngestThreadScope ?? resume?.stepResults?.input?.options?.__inngestThreadScope;
+        const ownsThread = !!threadScope && this.id === 'inngest:durable-agentic-loop';
         let result: WorkflowResult<TState, TInput, TOutput, TSteps>;
         try {
+          if (ownsThread) {
+            const registration = await step.invoke('register-agent-thread', {
+              function: getThreadFunctions(this.inngest).command,
+              data: { ...threadScope, id: `${runId}:register`, operation: 'register', runId },
+            });
+            if (registration?.busy) throw new NonRetriableError('Another Inngest run owns this thread');
+          }
           result = await engine.execute<TState, TInput, WorkflowResult<TState, TInput, TOutput, TSteps>>({
             workflowId: this.id,
             runId,
@@ -781,6 +807,13 @@ export class InngestWorkflow<
               this.logger.debug?.('Failed to flush observability:', flushError);
             }
           }
+        }
+
+        if (ownsThread && result.status !== 'suspended') {
+          await step.invoke('complete-agent-thread', {
+            function: getThreadFunctions(this.inngest).command,
+            data: { ...threadScope, id: `${runId}:complete`, operation: 'complete', runId },
+          });
         }
 
         if (finalizeErrored) {
