@@ -16,6 +16,9 @@
 import { stepCountIs } from '@internal/ai-sdk-v5';
 import { it, expect, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { EventEmitterPubSub } from '../../../../events/event-emitter';
+import { Mastra } from '../../../../mastra';
+import { MockMemory } from '../../../../memory/mock';
 import { createTool } from '../../../../tools';
 import {
   createSharedAgent,
@@ -30,53 +33,82 @@ describeForAllEngines(
   engine => {
     const getMock = useLoopScenarioAimock();
 
-    it('halts the loop when abort signal is triggered after first tool call', async () => {
-      const abortController = new AbortController();
-      let toolExecuted = false;
+    it.each(engine === 'inngest' ? [false, true] : [false])(
+      'halts the loop after first tool call (remote abort: %s)',
+      async remoteAbort => {
+        const abortController = new AbortController();
+        let toolExecuted = false;
+        let remoteAgent: any;
+        const threadId = 'remote-abort-thread';
+        const resourceId = 'remote-abort-user';
 
-      const getData = createTool({
-        id: 'get_data',
-        description: 'Get data and trigger abort',
-        inputSchema: z.object({}),
-        outputSchema: z.object({ value: z.string() }),
-        execute: async () => {
-          toolExecuted = true;
-          // Abort after tool execution but before next model request
-          abortController.abort();
-          return { value: 'DATA_VALUE' };
-        },
-      });
+        const getData = createTool({
+          id: 'get_data',
+          description: 'Get data and trigger abort',
+          inputSchema: z.object({}),
+          outputSchema: z.object({ value: z.string() }),
+          execute: async () => {
+            toolExecuted = true;
+            // Abort after tool execution but before next model request
+            if (remoteAbort) {
+              expect(await remoteAgent.abortThreadStreamAsync({ resourceId, threadId })).toBe(true);
+            } else {
+              abortController.abort();
+            }
+            return { value: 'DATA_VALUE' };
+          },
+        });
 
-      const { requests, output } = await runLoopScenario({
-        engine,
-        llm: getMock(),
-        prompt: 'Get data and then continue.',
-        tools: { get_data: getData },
-        stopWhen: stepCountIs(10),
-        abortSignal: abortController.signal,
-        fixtures: llm => {
-          // Turn 1: emit a tool call
-          llm.on(
-            { endpoint: 'chat', hasToolResult: false },
-            {
-              toolCalls: [{ id: 'call_data', name: 'get_data', arguments: {} }],
-            },
-          );
-          // Turn 2: should not be reached due to abort
-          llm.on({ endpoint: 'chat', hasToolResult: true }, { content: 'This should not appear because we aborted.' });
-        },
-      });
+        const memory = remoteAbort ? new MockMemory() : undefined;
+        const sharedAgent = remoteAbort
+          ? await createSharedAgent(getMock(), { engine, memory, tools: { get_data: getData } })
+          : undefined;
+        if (sharedAgent) {
+          remoteAgent = new Mastra({
+            agents: { sender: sharedAgent.agent.__fork() },
+            storage: sharedAgent.mastra.getStorage(),
+            pubsub: new EventEmitterPubSub(),
+            logger: false,
+          }).getAgent('sender');
+        }
 
-      // Tool was executed
-      expect(toolExecuted).toBe(true);
+        const { requests, output } = await runLoopScenario({
+          engine,
+          llm: getMock(),
+          prompt: 'Get data and then continue.',
+          tools: { get_data: getData },
+          sharedAgent,
+          memory,
+          ...(remoteAbort ? { threadId, resourceId } : {}),
+          stopWhen: stepCountIs(10),
+          abortSignal: abortController.signal,
+          fixtures: llm => {
+            // Turn 1: emit a tool call
+            llm.on(
+              { endpoint: 'chat', hasToolResult: false },
+              {
+                toolCalls: [{ id: 'call_data', name: 'get_data', arguments: {} }],
+              },
+            );
+            // Turn 2: should not be reached due to abort
+            llm.on(
+              { endpoint: 'chat', hasToolResult: true },
+              { content: 'This should not appear because we aborted.' },
+            );
+          },
+        });
 
-      // Only one model request was made (the abort happened before the second request)
-      expect(requests.length).toBeLessThanOrEqual(2);
+        // Tool was executed
+        expect(toolExecuted).toBe(true);
 
-      // The output stream should indicate it was aborted/terminated
-      const finishReason = await output.finishReason;
-      expect(finishReason).toMatch(/abort|cancelled|error|tripwire/i);
-    });
+        // Only one model request was made (the abort happened before the second request)
+        expect(requests.length).toBeLessThanOrEqual(2);
+
+        // The output stream should indicate it was aborted/terminated
+        const finishReason = await output.finishReason;
+        expect(finishReason).toMatch(/abort|cancelled|error|tripwire/i);
+      },
+    );
 
     it('prevents the loop from starting when abort signal is already aborted', async () => {
       const abortController = new AbortController();

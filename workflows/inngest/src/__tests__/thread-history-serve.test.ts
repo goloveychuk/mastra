@@ -10,17 +10,25 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Agent } from '@mastra/core/agent';
+import { InMemoryServerCache } from '@mastra/core/cache';
 import { PubSub } from '@mastra/core/events';
+import { Mastra } from '@mastra/core/mastra';
 import { DefaultStorage } from '@mastra/libsql';
 import { Memory } from '@mastra/memory';
 import { simulateReadableStream } from 'ai';
+import { Inngest } from 'inngest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
+import { RedisStreamsPubSub } from '../../../../pubsub/redis-streams/src';
+import { connect } from '../connect';
 import { createInngestAgent } from '../durable-agent';
 import {
+  INNGEST_PORT,
   getSharedInngest,
   getSharedMastra,
   setupSharedTestInfrastructure,
+  startConnectInngestDevServer,
+  stopInngestDevServer,
   teardownSharedTestInfrastructure,
 } from './durable-agent.test.utils';
 
@@ -125,4 +133,86 @@ describe('Inngest agent thread history (serve topology)', () => {
     expect(chunks.filter(chunk => chunk.type === 'text-delta')).toEqual([]);
     trimSpy.mockRestore();
   });
+});
+
+describe('Inngest agent shared thread output', () => {
+  it.runIf(!!process.env.REDIS_URL)(
+    'streams to another instance through shared Redis output without Redis thread coordination',
+    async () => {
+      const suffix = crypto.randomUUID();
+      const threadId = `thread-output-${suffix}`;
+      const resourceId = `resource-output-${suffix}`;
+      const agentId = `agent-output-${suffix}`;
+      const devServer = await startConnectInngestDevServer();
+      const inngest = new Inngest({ id: `thread-output-${suffix}`, baseUrl: `http://localhost:${INNGEST_PORT}` });
+      const transports = [0, 1].map(
+        () =>
+          new RedisStreamsPubSub({
+            url: process.env.REDIS_URL!,
+            keyPrefix: `inngest-thread-output-${suffix}`,
+          }),
+      );
+      const leaseSpies = transports.flatMap(transport => [
+        vi.spyOn(transport, 'acquireLease'),
+        vi.spyOn(transport, 'getLeaseOwner'),
+      ]);
+      const publishSpies = transports.map(transport => vi.spyOn(transport, 'publish'));
+      const storage = new DefaultStorage({ id: `thread-output-${suffix}`, url: dbUrl });
+      const cache = new InMemoryServerCache();
+      const agents = transports.map(pubsub =>
+        createInngestAgent({
+          inngest,
+          pubsub,
+          cache,
+          agent: new Agent({
+            id: agentId,
+            name: 'Thread Output Agent',
+            instructions: 'Reply briefly.',
+            model: mockModel(),
+            memory: new Memory({ storage }),
+          }),
+        }),
+      );
+      const hosts = agents.map(agent => new Mastra({ storage, cache, agents: { [agentId]: agent } }));
+      let worker: Awaited<ReturnType<typeof connect>> | undefined;
+      let subscription: Awaited<ReturnType<(typeof agents)[1]['subscribeToThread']>> | undefined;
+      let reader: Promise<void> | undefined;
+      let result: Awaited<ReturnType<(typeof agents)[0]['stream']>> | undefined;
+      const chunks: any[] = [];
+      try {
+        worker = await connect({ mastra: hosts[0], inngest });
+        subscription = await hosts[1].getAgentById(agentId).subscribeToThread({ threadId, resourceId });
+        const subscribed = subscription;
+        reader = (async () => {
+          for await (const chunk of subscribed.stream as AsyncIterable<any>) chunks.push(chunk);
+        })();
+        result = await agents[0].stream('hi', { memory: { thread: threadId, resource: resourceId } });
+        for await (const chunk of result.output.fullStream) void chunk;
+        await vi.waitFor(
+          () => {
+            expect(chunks.some(chunk => chunk.type === 'finish' && chunk.runId === result!.runId)).toBe(true);
+          },
+          { timeout: 5_000 },
+        );
+        expect(
+          chunks
+            .filter(chunk => chunk.type === 'text-delta')
+            .map(chunk => chunk.payload.text)
+            .join(''),
+        ).toBe('stored once');
+        for (const spy of leaseSpies) expect(spy).not.toHaveBeenCalled();
+        for (const spy of publishSpies) {
+          expect(spy.mock.calls.some(([topic]) => topic.includes('owner-discovery'))).toBe(false);
+        }
+      } finally {
+        result?.cleanup();
+        subscription?.unsubscribe();
+        await reader;
+        await worker?.close();
+        await Promise.all(transports.map(transport => transport.close()));
+        await stopInngestDevServer(devServer);
+        for (const spy of [...leaseSpies, ...publishSpies]) spy.mockRestore();
+      }
+    },
+  );
 });

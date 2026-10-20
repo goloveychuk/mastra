@@ -5823,7 +5823,7 @@ export class AgentThreadStreamRuntime {
       return { skipped: true, reason: 'unchanged' };
     }
 
-    return this.sendSignal<OUTPUT>(agent, applied.signal, target, pubsub);
+    return agent.sendSignal<OUTPUT>(applied.signal, target);
   }
 
   /**

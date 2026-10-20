@@ -803,7 +803,7 @@ describe('InngestAgent parity surface', () => {
           durableAgent,
           result.output,
           expect.objectContaining({ closeOnSuspend }),
-          durableAgent.agent.getPubSub(),
+          durableAgent.getPubSub(),
           registrationOptions,
         );
       } finally {
@@ -1037,7 +1037,7 @@ describe('InngestAgent parity surface', () => {
           resourceId: 'user-1',
           memory: { thread: 'thread-1', resource: 'user-1', options: { lastMessages: 5 } },
         }),
-        durableAgent.agent.getPubSub(),
+        durableAgent.getPubSub(),
       );
       expect(registerSpy).not.toHaveBeenCalled();
     } finally {
@@ -1061,7 +1061,7 @@ describe('InngestAgent parity surface', () => {
         durableAgent,
         result.output,
         expect.not.objectContaining({ memory: expect.anything() }),
-        durableAgent.agent.getPubSub(),
+        durableAgent.getPubSub(),
       );
     } finally {
       result.cleanup();
@@ -1127,7 +1127,7 @@ describe('InngestAgent parity surface', () => {
             closeOnSuspend,
             memory: { thread: 'thread-1', resource: 'user-1' },
           }),
-          durableAgent.agent.getPubSub(),
+          durableAgent.getPubSub(),
           registrationOptions,
         );
       } finally {
@@ -1143,9 +1143,8 @@ describe('InngestAgent parity surface', () => {
     'publishes resumed completion once when events beat the dispatch acknowledgement and closeOnSuspend=%s',
     async closeOnSuspend => {
       const durableAgent = makeIsolatedAgent(`resume-thread-dispatch-race-${closeOnSuspend}`);
-      const threadPubsub = new EventEmitterPubSub();
+      const threadPubsub = durableAgent.getPubSub();
       const publishSpy = vi.spyOn(threadPubsub, 'publish');
-      durableAgent.agent.__setPubSub(threadPubsub);
       setSuspendedSnapshot(durableAgent);
       const runId = `resume-thread-dispatch-race-${closeOnSuspend}-run`;
       const threadId = 'thread-1';
@@ -1190,13 +1189,13 @@ describe('InngestAgent parity surface', () => {
         durableAgent,
         initial.output,
         { memory: { thread: threadId, resource: resourceId }, closeOnSuspend },
-        durableAgent.agent.getPubSub(),
+        durableAgent.getPubSub(),
         closeOnSuspend ? undefined : { continuation: 'across-suspension' },
       );
       const subscription = await agentThreadStreamRuntime.subscribeToThread(
         durableAgent,
         { threadId, resourceId },
-        durableAgent.agent.getPubSub(),
+        durableAgent.getPubSub(),
       );
       const parts: any[] = [];
       const reading = (async () => {
@@ -1963,58 +1962,13 @@ describe('InngestAgent parity surface', () => {
     });
   });
 
-  it('wakes an idle thread from sendSignal() through the durable stream, not the wrapped agent', async () => {
-    // sendSignal() is forwarded to the wrapped Agent by the Proxy. The thread
-    // runtime starts idle threads with `agent.stream()`, so without the
-    // runtime-agent hook the woken turn would bypass Inngest entirely.
-    const durableAgent = makeIsolatedAgent('signal-wake-durable');
-    const wrappedStream = vi.spyOn(durableAgent.agent, 'stream');
-    const durableStream = vi.fn(async () => {
-      throw new Error('STOP_AT_DURABLE_STREAM');
-    });
-    durableAgent.stream = durableStream as any;
-
-    const result = durableAgent.sendSignal(
-      { type: 'user-message', contents: 'wake up' },
-      { resourceId: 'signal-wake-resource', threadId: 'signal-wake-thread' },
+  it.each(['sendSignal', 'queueSignal'] as const)('rejects %s without a complete thread scope', async method => {
+    const durableAgent = makeIsolatedAgent(`missing-scope-${method}`);
+    const result = durableAgent[method](
+      { type: 'user-message', contents: 'Do not start a run' },
+      { runId: 'run-without-thread' },
     );
-
-    await expect(result.accepted).rejects.toThrow('STOP_AT_DURABLE_STREAM');
-    expect(durableStream).toHaveBeenCalledTimes(1);
-    expect(durableStream.mock.calls[0]?.[0]).toBe(result.signal);
-    expect(durableStream.mock.calls[0]?.[1]).toMatchObject({
-      untilIdle: true,
-      memory: { resource: 'signal-wake-resource', thread: 'signal-wake-thread' },
-    });
-    expect(wrappedStream).not.toHaveBeenCalled();
-  });
-
-  it('wakes an idle thread from sendNotificationSignal() through the durable stream', async () => {
-    // The notification inbox is the documented ingress for external events.
-    // An urgent notification on an idle thread must start the durable run.
-    const durableAgent = makeIsolatedAgent('notification-wake-durable');
-    const wrappedStream = vi.spyOn(durableAgent.agent, 'stream');
-    const durableStream = vi.fn(async () => {
-      throw new Error('STOP_AT_DURABLE_STREAM');
-    });
-    durableAgent.stream = durableStream as any;
-    // Registering with Mastra gives the wrapped agent the notifications storage domain.
-    new Mastra({
-      agents: { notificationWake: durableAgent as any },
-      storage: new InMemoryStore(),
-      logger: false,
-    });
-
-    const result = await durableAgent.sendNotificationSignal(
-      { source: 'test', kind: 'event', priority: 'urgent', summary: 'Start an idle turn' },
-      { resourceId: 'notification-wake-resource', threadId: 'notification-wake-thread' },
-    );
-
-    expect(result.decision.action).toBe('deliver');
-    expect(result.record.lastDeliveryError).toBe('STOP_AT_DURABLE_STREAM');
-    expect(durableStream).toHaveBeenCalledTimes(1);
-    expect(durableStream.mock.calls[0]?.[1]).toMatchObject({ untilIdle: true });
-    expect(wrappedStream).not.toHaveBeenCalled();
+    await expect(result.accepted).rejects.toThrow('resourceId and threadId');
   });
 
   it('registers durable runs with the thread-stream runtime so thread APIs can find them', async () => {

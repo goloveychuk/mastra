@@ -9575,6 +9575,10 @@ export class Agent<
     return agentThreadStreamRuntime.getActiveThreadRunId(options, this.getPubSub());
   }
 
+  __getThreadState(options: AgentThreadIdentityOptions): 'active' | 'idle' | Promise<'active' | 'idle'> {
+    return agentThreadStreamRuntime.getThreadState(options, this.getPubSub());
+  }
+
   listActiveThreadRuns(): ActiveThreadRun[] {
     return agentThreadStreamRuntime.listActiveThreadRuns(this.getPubSub());
   }
@@ -9907,10 +9911,10 @@ export class Agent<
       );
     }
 
-    const threadState = agentThreadStreamRuntime.getThreadState(
-      { resourceId: target.resourceId, threadId: target.threadId },
-      this.getPubSub(),
-    );
+    const threadState = await this.#getThreadRuntimeAgent().__getThreadState({
+      resourceId: target.resourceId,
+      threadId: target.threadId,
+    });
     const now = new Date();
     const planned = [];
     for (const record of records) {
@@ -9972,24 +9976,19 @@ export class Agent<
 
         if (shouldEmitSummaryNow) {
           const signal = createNotificationSummarySignal(summarizeNotifications([updated]));
-          const result = agentThreadStreamRuntime.sendSignal<OUTPUT>(
-            this.#getThreadRuntimeAgent(),
-            signal,
-            {
-              ...target,
-              ifIdle: {
-                // Caller-supplied stream options win over the policy's. The
-                // policy's options are typed on the default OUTPUT, matching
-                // how deliveries run.
-                ...(decision.streamOptions
-                  ? { streamOptions: decision.streamOptions as AgentExecutionOptions<OUTPUT> }
-                  : {}),
-                ...target.ifIdle,
-                behavior: record.priority === 'high' ? 'persist' : 'wake',
-              },
+          const result = this.#getThreadRuntimeAgent().sendSignal<OUTPUT>(signal, {
+            ...target,
+            ifIdle: {
+              // Caller-supplied stream options win over the policy's. The
+              // policy's options are typed on the default OUTPUT, matching
+              // how deliveries run.
+              ...(decision.streamOptions
+                ? { streamOptions: decision.streamOptions as AgentExecutionOptions<OUTPUT> }
+                : {}),
+              ...target.ifIdle,
+              behavior: record.priority === 'high' ? 'persist' : 'wake',
             },
-            this.getPubSub(),
-          );
+          });
           let summaryAccepted: SendAgentSignalAccepted<OUTPUT>;
           try {
             summaryAccepted = await result.accepted;
@@ -10051,12 +10050,7 @@ export class Agent<
               ifIdle: { ...target.ifIdle, streamOptions: decision.streamOptions as AgentExecutionOptions<OUTPUT> },
             }
           : target;
-      const result = agentThreadStreamRuntime.sendSignal<OUTPUT>(
-        this.#getThreadRuntimeAgent(),
-        signal,
-        deliverTarget,
-        this.getPubSub(),
-      );
+      const result = this.#getThreadRuntimeAgent().sendSignal<OUTPUT>(signal, deliverTarget);
       let delivered: SendAgentSignalAccepted<OUTPUT>;
       try {
         delivered = await result.accepted;

@@ -1,6 +1,7 @@
 import type { Mastra } from '@mastra/core/mastra';
 import type { InngestFunction } from 'inngest';
 import { isInngestAgent } from './durable-agent';
+import { getThreadFunctions, registerThreadHost } from './durable-agent/thread-controller';
 import { InngestWorkflow } from './workflow';
 
 export function collectInngestFunctions({
@@ -23,6 +24,12 @@ export function collectInngestFunctions({
     if (!(workflow instanceof InngestWorkflow)) continue;
 
     workflow.__registerMastra(mastra);
+    if (workflow.id === 'inngest:durable-agentic-loop') {
+      registerThreadHost(workflow.inngest, mastra);
+      for (const fn of Object.values(getThreadFunctions(workflow.inngest))) {
+        workflowFunctions.set(fn.id(), fn);
+      }
+    }
     for (const fn of workflow.getFunctions()) {
       const functionId = fn.id();
       if (!workflowFunctions.has(functionId)) {
